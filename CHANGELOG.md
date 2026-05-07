@@ -4,6 +4,7 @@
 ## [0.8.2] - 2026-05-07
 
 ### Fixed
+- **TTL race condition** — unified TTL semantics across registries; repo_index invalidation no longer races with concurrent publishes (#266)
 - **NuGet autocomplete leak** — `SearchAutocompleteService` URLs in service index now rewrite to NORA instead of leaking to `azuresearch-*.nuget.org`. New `/nuget/v3/autocomplete` proxy endpoint with graceful fallback (#262)
 - **NuGet gallery leak** — `SearchGalleryQueryService` root URLs (`azuresearch-{usnc,ussc}.nuget.org/`) now rewrite to NORA. Zero azuresearch URLs remain in service index
 - **NuGet 429 during cache warming** — registry proxy routes no longer double-limited by `general_limiter` + `upload_limiter`. Removes 429 errors during `dotnet restore` with many packages while keeping auth rate limiting active
