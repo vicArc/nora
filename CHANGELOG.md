@@ -1,6 +1,11 @@
 # Changelog
 ## [Unreleased]
 
+## [0.8.3] - 2026-05-08
+
+### Added
+- **Security audit report** — static-analysis audit of source and supply chain published as `SECURITY-AUDIT.md` in the repository root.
+
 ### Fixed
 - **OpenAPI 429 documentation** — all rate-limited endpoints (44 total) now document `429` response with `Retry-After` header in OpenAPI spec. Eliminates false positives from API fuzz tools like Schemathesis (#267)
 - **405 Method Not Allowed with Allow header** — unsupported HTTP methods on multi-method routes now return `405` with RFC 9110 `Allow` header instead of axum's default headerless 405. Affected registries: Docker, Raw, Maven, npm, PyPI, Cargo (#268)
