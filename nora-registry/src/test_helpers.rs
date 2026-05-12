@@ -24,6 +24,7 @@ use crate::dashboard_metrics::DashboardMetrics;
 use crate::registry;
 use crate::repo_index::RepoIndex;
 use crate::storage::Storage;
+use crate::storage_stats::StorageStatsCache;
 use crate::tokens::TokenStore;
 use crate::AppState;
 
@@ -77,6 +78,7 @@ fn build_context(
             public_url: None,
             body_limit_mb: 2048,
             docker_stream_threshold_mb: 1024,
+            storage_stats_interval_secs: 60,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,
@@ -206,6 +208,11 @@ fn build_context(
     let enabled_registries = config.enabled_registries();
     let cb_config = config.circuit_breaker.clone();
 
+    // Tests use a zero-initialized cache.  Handlers that previously called
+    // storage.total_size() inline now read from this cache; Bishop's test
+    // suite drives refresh_once explicitly where needed.
+    let stats = StorageStatsCache::new();
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -225,6 +232,7 @@ fn build_context(
         curation: curation_engine,
         auth_failures: crate::auth::AuthFailureTracker::new(5, 900),
         circuit_breaker: crate::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        stats,
     });
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
