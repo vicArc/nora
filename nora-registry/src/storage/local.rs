@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
@@ -163,6 +163,46 @@ impl StorageBackend for LocalStorage {
 
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+        let dst = self.key_to_path(key);
+
+        // Ensure parent directory exists.
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+
+        // Attempt an atomic rename first (works when src and dst share the
+        // same filesystem). If that fails for any reason, fall back to a
+        // streaming copy so the method is cross-device safe.
+        if let Err(rename_err) = fs::rename(src, &dst).await {
+            tracing::debug!(
+                error = %rename_err,
+                src = %src.display(),
+                dst = %dst.display(),
+                "put_from_path: rename failed, falling back to streaming copy"
+            );
+
+            // Streaming copy — no full-file allocation.
+            let mut src_file = fs::File::open(src)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let mut dst_file = fs::File::create(&dst)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+
+            tokio::io::copy(&mut src_file, &mut dst_file)
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+
+            // Remove source after successful copy.
+            let _ = fs::remove_file(src).await;
+        }
+
+        Ok(())
     }
 }
 
@@ -416,5 +456,130 @@ mod tests {
             storage.get("del/key").await,
             Err(crate::storage::StorageError::NotFound)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // put_from_path tests
+    // -----------------------------------------------------------------------
+
+    /// Happy path: source and destination are on the same filesystem (same tempdir),
+    /// so `put_from_path` performs an atomic rename.
+    /// After the call: destination has the expected bytes; source no longer exists.
+    #[tokio::test]
+    async fn put_from_path_local_rename_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        // Write a source file directly into the storage root (same FS as dst).
+        let payload = b"streamed blob content";
+        let src = temp_dir.path().join("tmp-source.bin");
+        std::fs::write(&src, payload).unwrap();
+
+        // Move it into storage under a well-formed key.
+        storage
+            .put_from_path("docker/myimage/blobs/sha256-abc", &src)
+            .await
+            .unwrap();
+
+        // Source must be gone (rename consumed it).
+        assert!(
+            !src.exists(),
+            "source file must not exist after successful rename"
+        );
+
+        // Destination must contain exactly the original bytes.
+        let stored = storage
+            .get("docker/myimage/blobs/sha256-abc")
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.as_ref(),
+            payload,
+            "stored bytes must match original payload"
+        );
+    }
+
+    /// Cross-device fallback: when rename fails (simulated by providing a
+    /// non-existent source path after a successful initial write), the
+    /// streaming copy branch handles a missing source correctly and returns
+    /// an error instead of panicking.
+    ///
+    /// Note: we cannot easily force an EXDEV error in a unit test without
+    /// OS-level mount shenanigans, but we can verify the error-handling path
+    /// does not panic on an unreadable source.
+    #[tokio::test]
+    async fn put_from_path_local_cross_fs_copy_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        // A source path that does not exist → rename fails → copy fallback →
+        // open fails → StorageError::Io returned (not a panic).
+        let nonexistent = temp_dir.path().join("does-not-exist.bin");
+        let result = storage
+            .put_from_path("docker/myimage/blobs/sha256-fallback", &nonexistent)
+            .await;
+
+        // The implementation must return an error, not panic.
+        assert!(
+            result.is_err(),
+            "put_from_path with nonexistent source must return Err"
+        );
+        // It should be an Io variant, not a Validation error.
+        assert!(
+            matches!(result, Err(StorageError::Io(_))),
+            "error must be StorageError::Io, got: {:?}",
+            result
+        );
+    }
+
+    /// A key containing `..` must be rejected by `validate_storage_key` inside
+    /// the `Storage` wrapper before any I/O occurs.  This is the path-traversal
+    /// trust boundary that protects the streaming `put_from_path` path.
+    ///
+    /// We test via `crate::storage::Storage` (the public wrapper) because that
+    /// is where `validate_storage_key` is called; `LocalStorage::put_from_path`
+    /// itself is called only after validation succeeds.
+    #[tokio::test]
+    async fn put_from_path_local_invalid_key_rejected() {
+        use crate::storage::{Storage, StorageError};
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(temp_dir.path().to_str().unwrap());
+
+        // Create a real source file so the only reason for failure is validation.
+        let src = temp_dir.path().join("legit-source.bin");
+        std::fs::write(&src, b"data").unwrap();
+
+        // Key with leading path traversal.
+        let result_traversal = storage.put_from_path("../etc/passwd", &src).await;
+        assert!(
+            result_traversal.is_err(),
+            "path-traversal key must be rejected"
+        );
+        assert!(
+            matches!(result_traversal, Err(StorageError::Validation(_))),
+            "must be a Validation error, got: {:?}",
+            result_traversal
+        );
+
+        // Key with embedded `..` segment.
+        let result_embedded = storage
+            .put_from_path("docker/../../../etc/cron.d/evil", &src)
+            .await;
+        assert!(
+            result_embedded.is_err(),
+            "embedded path traversal must be rejected"
+        );
+        assert!(
+            matches!(result_embedded, Err(StorageError::Validation(_))),
+            "must be a Validation error, got: {:?}",
+            result_embedded
+        );
+
+        // Confirm no files escaped to unexpected locations.
+        assert!(
+            !std::path::Path::new("../etc/passwd").exists(),
+            "traversal destination must not have been created"
+        );
     }
 }

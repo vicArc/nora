@@ -76,6 +76,7 @@ fn build_context(
             port: 0,
             public_url: None,
             body_limit_mb: 2048,
+            docker_stream_threshold_mb: 1024,
         },
         storage: StorageConfig {
             mode: StorageMode::Local,

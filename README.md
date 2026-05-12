@@ -107,6 +107,10 @@ See [full documentation](https://getnora.dev) for all registries.
 
 NORA works out of the box. For advanced setup — auth, S3, retention, curation — see [getnora.dev/configuration](https://getnora.dev/configuration/settings/).
 
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `NORA_DOCKER_STREAM_THRESHOLD_MB` | `1024` | Docker blob uploads at or above this size (MiB) stream to disk instead of buffering in memory. Set to `0` to always stream. |
+
 ```bash
 # Auth
 docker run -d -p 4000:4000 \

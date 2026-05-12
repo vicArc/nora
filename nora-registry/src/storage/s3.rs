@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
-use object_store::path::Path;
+use object_store::path::Path as S3Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use std::path::Path;
+use tokio::io::AsyncReadExt as _;
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
 
@@ -82,7 +84,7 @@ fn map_err(e: object_store::Error) -> StorageError {
 impl StorageBackend for S3Storage {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let encoded = encode_s3_key(key);
-        let path = Path::from(encoded);
+        let path = S3Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
         self.store.put(&path, payload).await.map_err(map_err)?;
         Ok(())
@@ -90,7 +92,7 @@ impl StorageBackend for S3Storage {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let encoded = encode_s3_key(key);
-        let path = Path::from(encoded);
+        let path = S3Path::from(encoded);
         let result = self.store.get(&path).await.map_err(map_err)?;
         let bytes = result.bytes().await.map_err(map_err)?;
         Ok(bytes)
@@ -98,14 +100,14 @@ impl StorageBackend for S3Storage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let encoded = encode_s3_key(key);
-        let path = Path::from(encoded);
+        let path = S3Path::from(encoded);
         self.store.delete(&path).await.map_err(map_err)?;
         Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Vec<String> {
         let encoded = encode_s3_key(prefix);
-        let prefix_path = Path::from(encoded);
+        let prefix_path = S3Path::from(encoded);
         let list_prefix = if prefix.is_empty() {
             None
         } else {
@@ -127,7 +129,7 @@ impl StorageBackend for S3Storage {
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_s3_key(key);
-        let path = Path::from(encoded);
+        let path = S3Path::from(encoded);
         let meta = self.store.head(&path).await.ok()?;
 
         let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
@@ -164,6 +166,59 @@ impl StorageBackend for S3Storage {
             self.size_cache_initialized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+        use object_store::MultipartUpload as _;
+
+        const PART_SIZE: usize = 8 * 1024 * 1024; // 8 MiB per part
+
+        let encoded = encode_s3_key(key);
+        let s3_path = S3Path::from(encoded);
+
+        let mut upload = self.store.put_multipart(&s3_path).await.map_err(map_err)?;
+
+        let mut file = tokio::fs::File::open(src)
+            .await
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+
+        let mut buf = vec![0u8; PART_SIZE];
+        loop {
+            let mut total_read = 0usize;
+            // Fill the buffer fully before sending a part (last part may be smaller).
+            loop {
+                match file.read(&mut buf[total_read..]).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total_read += n;
+                        if total_read == PART_SIZE {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = upload.abort().await;
+                        return Err(StorageError::Io(e.to_string()));
+                    }
+                }
+            }
+
+            if total_read == 0 {
+                break;
+            }
+
+            let part_bytes = Bytes::copy_from_slice(&buf[..total_read]);
+            if let Err(e) = upload.put_part(part_bytes.into()).await {
+                let _ = upload.abort().await;
+                return Err(map_err(e));
+            }
+        }
+
+        upload.complete().await.map_err(map_err)?;
+
+        // Remove the local source file after a successful S3 upload.
+        let _ = tokio::fs::remove_file(src).await;
+
+        Ok(())
     }
 }
 

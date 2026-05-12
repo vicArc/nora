@@ -8,6 +8,7 @@ use argon2::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -409,10 +410,10 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Set file permissions to 600 (owner read/write only)
-fn set_file_permissions_600(path: &Path) {
+fn set_file_permissions_600(_path: &Path) {
     #[cfg(unix)]
     {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -570,6 +571,8 @@ mod tests {
             .unwrap();
 
         let file_id = sha256_hex(&token);
+        // Only used in the unix-specific permission check below.
+        #[allow(unused_variables)]
         let file_path = temp_dir.path().join(format!("{}.json", &file_id[..16]));
 
         #[cfg(unix)]

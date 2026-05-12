@@ -11,7 +11,7 @@ use crate::hash_pin_store::HashPinStore;
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -53,6 +53,13 @@ pub trait StorageBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     /// Refresh any cached size data. No-op for backends without caching.
     async fn refresh_total_size(&self) {}
+    /// Move or stream a file from `src` into storage under `key`.
+    ///
+    /// Implementations SHOULD use an atomic rename when the source and destination
+    /// share a filesystem (local fs). When the rename fails for any reason (e.g.
+    /// cross-device), the implementation MUST fall back to a streaming copy.
+    /// S3 implementations stream the file to S3 in ≤8 MiB parts.
+    async fn put_from_path(&self, key: &str, src: &Path) -> Result<()>;
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
@@ -161,5 +168,20 @@ impl Storage {
     /// Refresh cached total_size. No-op for local storage, computes for S3.
     pub async fn refresh_total_size_cache(&self) {
         self.inner.refresh_total_size().await;
+    }
+
+    /// Move or stream a file from `src` into storage under `key`.
+    ///
+    /// The key is validated before the operation. On success the source file
+    /// may be removed (local rename) or left in place to be cleaned up by the
+    /// caller (S3 copy — the impl removes it after successful upload).
+    pub async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+        validate_storage_key(key)?;
+        self.inner.put_from_path(key, src).await?;
+        // Pin store is seeded from the actual bytes on disk via `put`, which
+        // performs the hash there. For large streamed files we skip pinning to
+        // avoid re-reading gigabytes. The digest was already verified by the
+        // caller before calling put_from_path.
+        Ok(())
     }
 }

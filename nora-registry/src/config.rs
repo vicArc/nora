@@ -77,10 +77,19 @@ pub struct ServerConfig {
     /// Maximum request body size in MB (default: 2048 = 2GB)
     #[serde(default = "default_body_limit_mb")]
     pub body_limit_mb: usize,
+    /// Threshold in MB above which Docker blob uploads stream to disk instead
+    /// of buffering in memory (default: 1024 = 1 GiB).
+    /// Set via NORA_DOCKER_STREAM_THRESHOLD_MB env var.
+    #[serde(default = "default_docker_stream_threshold_mb")]
+    pub docker_stream_threshold_mb: usize,
 }
 
 fn default_body_limit_mb() -> usize {
     2048 // 2GB - enough for any Docker image
+}
+
+fn default_docker_stream_threshold_mb() -> usize {
+    1024 // 1 GiB
 }
 
 /// TLS configuration for outbound connections to upstream registries.
@@ -1501,6 +1510,21 @@ impl Config {
                 .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
         }
 
+        // 5a. Docker stream threshold sanity checks
+        if self.server.docker_stream_threshold_mb == 0 {
+            warnings.push(
+                "server.docker_stream_threshold_mb is 0 — all Docker blob uploads will stream to disk regardless of size".to_string(),
+            );
+        }
+        if self.server.body_limit_mb > 0
+            && self.server.docker_stream_threshold_mb > self.server.body_limit_mb
+        {
+            warnings.push(format!(
+                "server.docker_stream_threshold_mb ({} MB) exceeds body_limit_mb ({} MB) — the streaming path will never be triggered",
+                self.server.docker_stream_threshold_mb, self.server.body_limit_mb
+            ));
+        }
+
         // 6. Relative paths with explicit config — may resolve unexpectedly
         if config_path.is_some() {
             if self.storage.mode == StorageMode::Local && !self.storage.path.starts_with('/') {
@@ -1653,6 +1677,11 @@ impl Config {
         if let Ok(val) = env::var("NORA_BODY_LIMIT_MB") {
             if let Ok(mb) = val.parse() {
                 self.server.body_limit_mb = mb;
+            }
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_STREAM_THRESHOLD_MB") {
+            if let Ok(mb) = val.parse() {
+                self.server.docker_stream_threshold_mb = mb;
             }
         }
 
@@ -2157,6 +2186,7 @@ impl Default for Config {
                 port: 4000,
                 public_url: None,
                 body_limit_mb: 2048,
+                docker_stream_threshold_mb: 1024,
             },
             storage: StorageConfig {
                 mode: StorageMode::Local,

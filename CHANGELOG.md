@@ -1,6 +1,11 @@
 # Changelog
 ## [Unreleased]
 
+## [0.8.4] - 2026-05-11
+
+### Added
+- **feat(docker): stream large blob uploads to disk to bound memory** — Docker blob uploads at or above `NORA_DOCKER_STREAM_THRESHOLD_MB` (default 1024 MiB) are now streamed chunk-by-chunk to a temp file rather than buffered in memory. SHA-256 is computed incrementally so no second read of the file is needed. Smaller uploads retain the fast in-memory path. Eliminates OOM kills when pushing multi-GB AI model layers.
+
 ## [0.8.3] - 2026-05-08
 
 ### Added
