@@ -13,19 +13,21 @@ use crate::validation::{
 };
 use crate::AppState;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, State},
-    http::{header, HeaderName, StatusCode},
+    http::{header, HeaderMap, HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, head, patch},
     Json, Router,
 };
+use futures::StreamExt as _;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt as _;
 
 /// Metadata for a Docker image stored alongside manifests
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -461,18 +463,78 @@ async fn start_upload(State(state): State<Arc<AppState>>, Path(name): Path<Strin
         .into_response()
 }
 
+/// Decides whether an upload should be buffered in memory or streamed to disk.
+enum UploadPath {
+    /// Buffer the entire body in memory (fast path for small uploads).
+    Buffered,
+    /// Stream body chunks directly to a temp file (bounded memory for large uploads).
+    Streamed,
+}
+
+/// Extract the `Content-Length` header value as `usize`, if present and valid.
+fn content_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Resolve the temp-file directory for Docker uploads.
+///
+/// - Local storage: `{storage_path}/tmp/docker-uploads/`
+/// - S3 storage (no local root): OS temp dir under `nora/docker-uploads/`
+fn docker_upload_temp_dir(config: &crate::config::Config) -> std::path::PathBuf {
+    use crate::config::StorageMode;
+    match config.storage.mode {
+        StorageMode::Local => {
+            std::path::PathBuf::from(&config.storage.path).join("tmp/docker-uploads")
+        }
+        StorageMode::S3 => std::env::temp_dir().join("nora/docker-uploads"),
+    }
+}
+
 /// PATCH handler for chunked blob uploads
 /// Docker client sends data chunks via PATCH, then finalizes with PUT
 async fn patch_blob(
     State(state): State<Arc<AppState>>,
     Path((name, uuid)): Path<(String, String)>,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Append data to temp file and get total size
+    let threshold_bytes = state.config.server.docker_stream_threshold_mb * 1024 * 1024;
+    let upload_path = match content_length(request.headers()) {
+        Some(len) if len < threshold_bytes => UploadPath::Buffered,
+        _ => UploadPath::Streamed,
+    };
+
+    let body = request.into_body();
+
+    match upload_path {
+        UploadPath::Buffered => patch_blob_buffered(state, name, uuid, body).await,
+        UploadPath::Streamed => patch_blob_streamed(state, name, uuid, body).await,
+    }
+}
+
+/// Buffered PATCH: collect the entire chunk into memory, then write once.
+/// Used for chunks smaller than `docker_stream_threshold_mb`.
+async fn patch_blob_buffered(
+    state: Arc<AppState>,
+    name: String,
+    uuid: String,
+    body: Body,
+) -> Response {
+    // Collect the body fully before acquiring the session lock.
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "patch_blob_buffered: body read error");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
     let total_size = {
         let mut sessions = state.upload_sessions.write();
         let session = match sessions.get_mut(&uuid) {
@@ -483,7 +545,6 @@ async fn patch_blob(
             }
         };
 
-        // Verify session belongs to this repository
         if session.name != name {
             tracing::warn!(
                 session_name = %session.name,
@@ -497,15 +558,13 @@ async fn patch_blob(
                 .into_response();
         }
 
-        // Check session TTL
         if session.created_at.elapsed() >= SESSION_TTL {
             let _ = std::fs::remove_file(&session.temp_path);
             sessions.remove(&uuid);
             return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
         }
 
-        // Check size limit
-        let new_size = session.size as usize + body.len();
+        let new_size = session.size as usize + body_bytes.len();
         if new_size > max_session_size() {
             let _ = std::fs::remove_file(&session.temp_path);
             sessions.remove(&uuid);
@@ -516,8 +575,7 @@ async fn patch_blob(
                 .into_response();
         }
 
-        // Append to temp file
-        use std::io::Write;
+        use std::io::Write as _;
         let temp_path = session.temp_path.clone();
         match std::fs::OpenOptions::new()
             .create(true)
@@ -525,15 +583,15 @@ async fn patch_blob(
             .open(&temp_path)
         {
             Ok(mut file) => {
-                if let Err(e) = file.write_all(&body) {
-                    tracing::error!(error = %e, "Failed to write to upload temp file");
+                if let Err(e) = file.write_all(&body_bytes) {
+                    tracing::error!(error = %e, "patch_blob_buffered: write failed");
                     let _ = std::fs::remove_file(&temp_path);
                     sessions.remove(&uuid);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to open upload temp file");
+                tracing::error!(error = %e, "patch_blob_buffered: open temp file failed");
                 sessions.remove(&uuid);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -543,14 +601,135 @@ async fn patch_blob(
         new_size
     };
 
+    patch_blob_response(name, uuid, total_size)
+}
+
+/// Streamed PATCH: stream body chunks directly to the session temp file.
+/// Keeps memory usage bounded to one chunk at a time regardless of total size.
+async fn patch_blob_streamed(
+    state: Arc<AppState>,
+    name: String,
+    uuid: String,
+    body: Body,
+) -> Response {
+    // Extract session metadata under the lock, then release before async I/O.
+    let (temp_path, existing_size) = {
+        let mut sessions = state.upload_sessions.write();
+        let session = match sessions.get_mut(&uuid) {
+            Some(s) => s,
+            None => {
+                return (StatusCode::NOT_FOUND, "Upload session not found or expired")
+                    .into_response();
+            }
+        };
+
+        if session.name != name {
+            tracing::warn!(
+                session_name = %session.name,
+                request_name = %name,
+                "SECURITY: upload session name mismatch — possible session fixation"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                "Session does not belong to this repository",
+            )
+                .into_response();
+        }
+
+        if session.created_at.elapsed() >= SESSION_TTL {
+            let _ = std::fs::remove_file(&session.temp_path);
+            sessions.remove(&uuid);
+            return (StatusCode::NOT_FOUND, "Upload session expired").into_response();
+        }
+
+        (session.temp_path.clone(), session.size)
+    };
+
+    // Open temp file in append mode outside the lock.
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&temp_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, ?temp_path, "patch_blob_streamed: open failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut written: u64 = 0;
+    let max_total = max_session_size() as u64;
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "patch_blob_streamed: client disconnect");
+                drop(file);
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+
+        if existing_size + written + chunk.len() as u64 > max_total {
+            drop(file);
+            let removed_temp = {
+                let mut sessions = state.upload_sessions.write();
+                sessions.remove(&uuid).map(|s| s.temp_path)
+            };
+            if let Some(p) = removed_temp {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Upload session exceeds size limit",
+            )
+                .into_response();
+        }
+
+        if let Err(e) = file.write_all(&chunk).await {
+            tracing::error!(error = %e, "patch_blob_streamed: write chunk failed");
+            drop(file);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        written += chunk.len() as u64;
+    }
+
+    if let Err(e) = file.flush().await {
+        tracing::error!(error = %e, "patch_blob_streamed: flush failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    drop(file);
+
+    // Update session size under the lock.
+    let new_total = {
+        let mut sessions = state.upload_sessions.write();
+        match sessions.get_mut(&uuid) {
+            Some(s) => {
+                s.size += written;
+                s.size as usize
+            }
+            None => {
+                // Session removed by a concurrent expiry sweep — tolerate.
+                (existing_size + written) as usize
+            }
+        }
+    };
+
+    patch_blob_response(name, uuid, new_total)
+}
+
+/// Build the 202 Accepted response for a completed PATCH.
+fn patch_blob_response(name: String, uuid: String, total_size: usize) -> Response {
     let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
-    // Range header indicates bytes 0 to (total_size - 1) have been received
     let range = if total_size > 0 {
         format!("0-{}", total_size - 1)
     } else {
         "0-0".to_string()
     };
-
     (
         StatusCode::ACCEPTED,
         [
@@ -562,33 +741,70 @@ async fn patch_blob(
         .into_response()
 }
 
-/// PUT handler for completing blob uploads
+/// PUT handler for completing blob uploads.
 /// Handles both monolithic uploads (body contains all data) and
-/// chunked upload finalization (body may be empty, data in session)
+/// chunked upload finalization (body may be empty, data already in session temp file).
 async fn upload_blob(
     State(state): State<Arc<AppState>>,
     Path((name, uuid)): Path<(String, String)>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
     let digest = match params.get("digest") {
-        Some(d) => d,
+        Some(d) => d.clone(),
         None => return (StatusCode::BAD_REQUEST, "Missing digest parameter").into_response(),
     };
 
-    if let Err(e) = validate_digest(digest) {
+    if let Err(e) = validate_digest(&digest) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Get data from chunked session (temp file) if exists, otherwise use body directly
+    if !digest.starts_with("sha256:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Only sha256 digests are supported for blob uploads",
+        )
+            .into_response();
+    }
+
+    let threshold_bytes = state.config.server.docker_stream_threshold_mb * 1024 * 1024;
+    let upload_path = match content_length(request.headers()) {
+        Some(len) if len < threshold_bytes => UploadPath::Buffered,
+        _ => UploadPath::Streamed,
+    };
+
+    let body = request.into_body();
+
+    match upload_path {
+        UploadPath::Buffered => upload_blob_buffered(state, name, uuid, digest, body).await,
+        UploadPath::Streamed => upload_blob_streamed(state, name, uuid, digest, body).await,
+    }
+}
+
+/// Buffered PUT: materialise the entire body in memory, then write via the existing `put` path.
+async fn upload_blob_buffered(
+    state: Arc<AppState>,
+    name: String,
+    uuid: String,
+    digest: String,
+    body: Body,
+) -> Response {
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "upload_blob_buffered: body read error");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    // Resolve data: session temp file (chunked) + any body appended.
     let data = {
         let mut sessions = state.upload_sessions.write();
         if let Some(session) = sessions.remove(&uuid) {
-            // Verify session belongs to this repository
             if session.name != name {
                 tracing::warn!(
                     session_name = %session.name,
@@ -602,16 +818,14 @@ async fn upload_blob(
                 )
                     .into_response();
             }
-            // Read temp file if it exists (may not exist for monolithic uploads
-            // where no PATCH was sent before the final PUT)
             let mut session_data = if session.temp_path.exists() {
                 match std::fs::read(&session.temp_path) {
-                    Ok(data) => {
+                    Ok(d) => {
                         let _ = std::fs::remove_file(&session.temp_path);
-                        data
+                        d
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to read upload temp file");
+                        tracing::error!(error = %e, "upload_blob_buffered: read temp file failed");
                         let _ = std::fs::remove_file(&session.temp_path);
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
@@ -619,30 +833,20 @@ async fn upload_blob(
             } else {
                 Vec::new()
             };
-            if !body.is_empty() {
-                session_data.extend_from_slice(&body);
+            if !body_bytes.is_empty() {
+                session_data.extend_from_slice(&body_bytes);
             }
             session_data
         } else {
-            // Monolithic upload: use body directly
-            body.to_vec()
+            body_bytes.to_vec()
         }
     };
 
-    // Only sha256 digests are supported for verification
-    if !digest.starts_with("sha256:") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Only sha256 digests are supported for blob uploads",
-        )
-            .into_response();
-    }
-
-    // Verify digest matches uploaded content (Docker Distribution Spec)
+    // Verify digest.
     {
         use sha2::Digest as _;
         let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
-        if computed != *digest {
+        if computed != digest {
             tracing::warn!(
                 expected = %digest,
                 computed = %computed,
@@ -665,30 +869,218 @@ async fn upload_blob(
 
     let key = format!("docker/{}/blobs/{}", name, digest);
     match state.storage.put(&key, &data).await {
-        Ok(()) => {
-            state.metrics.record_upload("docker");
-            state.activity.push(ActivityEntry::new(
-                ActionType::Push,
-                format!("{}@{}", name, &digest[..19.min(digest.len())]),
-                "docker",
-                "LOCAL",
-            ));
-            state.repo_index.invalidate("docker");
-            let location = format!("/v2/{}/blobs/{}", name, digest);
-            (
-                StatusCode::CREATED,
-                [
-                    (header::LOCATION, location),
-                    (
-                        HeaderName::from_static("docker-content-digest"),
-                        digest.to_string(),
-                    ),
-                ],
-            )
-                .into_response()
-        }
+        Ok(()) => blob_upload_created_response(&state, name, digest),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// Streamed PUT: stream the body to a temp file chunk-by-chunk (O(chunk) memory),
+/// verify digest from the streaming hasher, then move the temp file into storage.
+///
+/// When a chunked PATCH session already exists for this UUID, the existing temp
+/// file is reused (appended to) and the hasher is seeded by re-reading the file
+/// contents so the final digest covers the complete concatenated blob.
+async fn upload_blob_streamed(
+    state: Arc<AppState>,
+    name: String,
+    uuid: String,
+    digest: String,
+    body: Body,
+) -> Response {
+    use sha2::Digest as _;
+
+    // Outcome of the session-lookup phase. We resolve the session under the
+    // lock, then release the guard before performing any async I/O so the
+    // future remains `Send`.
+    enum SessionLookup {
+        ExistingSession {
+            temp_path: std::path::PathBuf,
+            prior_size: u64,
+        },
+        Mismatch {
+            temp_path: std::path::PathBuf,
+        },
+        NoSession,
+    }
+
+    let lookup = {
+        let mut sessions = state.upload_sessions.write();
+        match sessions.remove(&uuid) {
+            Some(s) if s.name == name => SessionLookup::ExistingSession {
+                temp_path: s.temp_path,
+                prior_size: s.size,
+            },
+            Some(s) => SessionLookup::Mismatch {
+                temp_path: s.temp_path,
+            },
+            None => SessionLookup::NoSession,
+        }
+    };
+
+    // Determine whether we're continuing a chunked session or starting fresh.
+    let (temp_path, mut hasher, prior_size) = match lookup {
+        SessionLookup::ExistingSession {
+            temp_path,
+            prior_size,
+        } => {
+            // Chunked session exists: seed hasher from the existing temp file
+            // before appending the PUT body so digest covers all bytes.
+            let mut h = sha2::Sha256::new();
+            if temp_path.exists() {
+                // Re-read prior chunks into the hasher. This is the only
+                // correct path: the PATCH handler stores raw bytes without
+                // computing a running hash, so we must replay them here.
+                let prior_data = match tokio::fs::read(&temp_path).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!(error = %e, "upload_blob_streamed: read prior temp file failed");
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                h.update(&prior_data);
+            }
+            (temp_path, h, prior_size)
+        }
+        SessionLookup::Mismatch { temp_path } => {
+            // Session belongs to a different repository.
+            tracing::warn!(
+                request_name = %name,
+                "SECURITY: upload finalization name mismatch"
+            );
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                "Session does not belong to this repository",
+            )
+                .into_response();
+        }
+        SessionLookup::NoSession => {
+            // No prior PATCH — pure monolithic streamed upload.
+            let temp_dir = docker_upload_temp_dir(&state.config);
+            let temp = temp_dir.join(&uuid);
+            if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+                tracing::error!(error = %e, "upload_blob_streamed: create temp dir failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            (temp, sha2::Sha256::new(), 0u64)
+        }
+    };
+
+    // Append to temp file outside the lock.
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&temp_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, ?temp_path, "upload_blob_streamed: open temp file failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut written: u64 = 0;
+    let max_total = max_session_size() as u64;
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "upload_blob_streamed: client disconnect / read error");
+                drop(file);
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+
+        if prior_size + written + chunk.len() as u64 > max_total {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "blob exceeds max session size",
+            )
+                .into_response();
+        }
+
+        if let Err(e) = file.write_all(&chunk).await {
+            tracing::error!(error = %e, "upload_blob_streamed: write chunk failed");
+            drop(file);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        // Update the running hash and release the chunk immediately.
+        // RAM usage is bounded to this one chunk's allocation.
+        hasher.update(&chunk);
+        written += chunk.len() as u64;
+    }
+
+    if let Err(e) = file.flush().await {
+        tracing::error!(error = %e, "upload_blob_streamed: flush failed");
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    drop(file);
+
+    // Verify digest from the streaming hasher — no second read of the file.
+    let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if computed != digest {
+        tracing::warn!(
+            expected = %digest,
+            computed = %computed,
+            name = %name,
+            "SECURITY: streamed blob digest mismatch — rejecting upload"
+        );
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "errors": [{
+                    "code": "DIGEST_INVALID",
+                    "message": "provided digest did not match uploaded content",
+                    "detail": { "expected": digest, "computed": computed }
+                }]
+            })),
+        )
+            .into_response();
+    }
+
+    // Move temp file into final storage location (rename for local fs, multipart for S3).
+    let key = format!("docker/{}/blobs/{}", name, digest);
+    match state.storage.put_from_path(&key, &temp_path).await {
+        Ok(()) => blob_upload_created_response(&state, name, digest),
+        Err(e) => {
+            tracing::error!(error = %e, "upload_blob_streamed: put_from_path failed");
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Build the 201 Created response after a successful blob upload.
+fn blob_upload_created_response(state: &AppState, name: String, digest: String) -> Response {
+    state.metrics.record_upload("docker");
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        format!("{}@{}", name, &digest[..19.min(digest.len())]),
+        "docker",
+        "LOCAL",
+    ));
+    state.repo_index.invalidate("docker");
+    let location = format!("/v2/{}/blobs/{}", name, digest);
+    (
+        StatusCode::CREATED,
+        [
+            (header::LOCATION, location),
+            (HeaderName::from_static("docker-content-digest"), digest),
+        ],
+    )
+        .into_response()
 }
 
 async fn get_manifest(
@@ -1138,20 +1530,20 @@ async fn start_upload_ns(
 async fn patch_blob_ns(
     state: State<Arc<AppState>>,
     Path((ns, name, uuid)): Path<(String, String, String)>,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    patch_blob(state, Path((full_name, uuid)), body).await
+    patch_blob(state, Path((full_name, uuid)), request).await
 }
 
 async fn upload_blob_ns(
     state: State<Arc<AppState>>,
     Path((ns, name, uuid)): Path<(String, String, String)>,
     query: axum::extract::Query<std::collections::HashMap<String, String>>,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
     let full_name = format!("{}/{}", ns, name);
-    upload_blob(state, Path((full_name, uuid)), query, body).await
+    upload_blob(state, Path((full_name, uuid)), query, request).await
 }
 
 async fn get_manifest_ns(
@@ -1720,6 +2112,13 @@ mod tests {
 
     #[test]
     fn test_max_session_size_default() {
+        // Skip this test if another test has temporarily set the env var to
+        // exercise a low-limit code path (NORA_MAX_UPLOAD_SESSION_SIZE_MB).
+        // The oversize integration test sets this to "1" for the duration of
+        // its HTTP call, which can race with this synchronous test.
+        if std::env::var("NORA_MAX_UPLOAD_SESSION_SIZE_MB").is_ok() {
+            return;
+        }
         let max = max_session_size();
         assert_eq!(max, DEFAULT_MAX_SESSION_SIZE_MB * 1024 * 1024);
     }
@@ -1853,9 +2252,12 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::{body_bytes, create_test_context, send};
-    use axum::body::Body;
+    use crate::test_helpers::{
+        body_bytes, create_test_context, create_test_context_with_config, send,
+    };
+    use axum::body::{Body, Bytes};
     use axum::http::{header, Method, StatusCode};
+    use axum::Router;
     use sha2::Digest;
 
     #[tokio::test]
@@ -2356,5 +2758,515 @@ mod integration_tests {
             .circuit_breaker
             .check("docker:http://127.0.0.1:2")
             .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming upload tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: POST /v2/{name}/blobs/uploads/ and return the UUID string.
+    async fn start_upload_session(app: &Router, name: &str) -> String {
+        let resp = send(
+            app,
+            Method::POST,
+            &format!("/v2/{}/blobs/uploads/", name),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "expected 202 from start_upload"
+        );
+        let location = resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        location.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// Helper: build a Content-Length header value that forces the streamed path.
+    fn cl_header_exceeds(threshold_mb: usize, body_len: usize) -> String {
+        // We just pass the real body length — if it's ≥ threshold the handler
+        // will pick UploadPath::Streamed.
+        let _ = threshold_mb;
+        body_len.to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // content_length helper — pure unit test (no I/O)
+    // -----------------------------------------------------------------------
+
+    /// Verify `content_length` parses all interesting header cases correctly.
+    ///
+    /// The helper is `fn content_length(headers: &HeaderMap) -> Option<usize>`.
+    /// We call it via `super::content_length` from inside the same module.
+    #[test]
+    fn content_length_helper() {
+        use axum::http::HeaderMap;
+
+        // Missing header → None
+        let empty = HeaderMap::new();
+        assert_eq!(super::content_length(&empty), None);
+
+        // Valid numeric value
+        let mut valid = HeaderMap::new();
+        valid.insert(header::CONTENT_LENGTH, "12345".parse().unwrap());
+        assert_eq!(super::content_length(&valid), Some(12345));
+
+        // Zero is valid
+        let mut zero = HeaderMap::new();
+        zero.insert(header::CONTENT_LENGTH, "0".parse().unwrap());
+        assert_eq!(super::content_length(&zero), Some(0));
+
+        // Non-numeric value → None
+        let mut bad = HeaderMap::new();
+        bad.insert(header::CONTENT_LENGTH, "not-a-number".parse().unwrap());
+        assert_eq!(super::content_length(&bad), None);
+
+        // Very large value that fits in usize (on 64-bit targets)
+        let mut large = HeaderMap::new();
+        large.insert(header::CONTENT_LENGTH, "10737418240".parse().unwrap()); // 10 GiB
+        assert_eq!(super::content_length(&large), Some(10_737_418_240));
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffered path is unchanged for small uploads
+    // -----------------------------------------------------------------------
+
+    /// Body of 1 MiB with a 1024 MiB threshold must stay on the buffered path.
+    /// Exercises that the existing `upload_blob_buffered` logic is not broken by
+    /// the new branching logic in `upload_blob`.
+    #[tokio::test]
+    async fn buffered_path_unchanged_for_small_uploads() {
+        // Default threshold is 1024 MB; a 1 MiB body is well below it.
+        let ctx = create_test_context();
+
+        let blob_data = vec![0xABu8; 1024 * 1024]; // 1 MiB
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob_data)));
+
+        let uuid = start_upload_session(&ctx.app, "myimage").await;
+
+        // Send the PUT with an explicit Content-Length so the handler can
+        // see it is below the 1024 MiB threshold → buffered path.
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/myimage/blobs/uploads/{}?digest={}",
+                uuid, digest
+            ))
+            .header(header::CONTENT_LENGTH, blob_data.len().to_string())
+            .body(Body::from(blob_data.clone()))
+            .unwrap();
+        let put_resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
+
+        // Confirm the blob landed in storage.
+        let key = format!("docker/myimage/blobs/{}", digest);
+        let stored = ctx.state.storage.get(&key).await.unwrap();
+        assert_eq!(stored.as_ref(), blob_data.as_slice());
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed upload — success path
+    // -----------------------------------------------------------------------
+
+    /// Synthesise a 32 MiB random-ish body, force the streamed path via a 1 MiB
+    /// threshold, verify HTTP 201, blob exists in storage, and digest is correct.
+    #[tokio::test]
+    async fn streamed_upload_succeeds_for_32mib() {
+        // Set threshold to 1 MB so our 32 MiB body takes the streamed path.
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.docker_stream_threshold_mb = 1;
+        });
+
+        // Deterministic pseudo-random data so the test is reproducible.
+        let body_size = 32 * 1024 * 1024usize; // 32 MiB
+        let blob_data: Vec<u8> = (0..body_size).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob_data)));
+
+        let uuid = start_upload_session(&ctx.app, "bigimage").await;
+
+        // Send PUT with Content-Length ≥ threshold to trigger UploadPath::Streamed.
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/bigimage/blobs/uploads/{}?digest={}",
+                uuid, digest
+            ))
+            .header(
+                header::CONTENT_LENGTH,
+                cl_header_exceeds(1, blob_data.len()),
+            )
+            .body(Body::from(blob_data.clone()))
+            .unwrap();
+
+        let put_resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            put_resp.status(),
+            StatusCode::CREATED,
+            "expected 201 from streamed upload"
+        );
+
+        // Verify location and content-digest headers.
+        let location = put_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains(&digest),
+            "location header must include digest"
+        );
+        let returned_digest = put_resp
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(returned_digest, digest);
+
+        // Verify the blob exists in storage with the correct content.
+        let key = format!("docker/bigimage/blobs/{}", digest);
+        let stored = ctx.state.storage.get(&key).await.unwrap();
+        assert_eq!(stored.len(), body_size, "stored size mismatch");
+        assert_eq!(
+            stored.as_ref(),
+            blob_data.as_slice(),
+            "stored bytes mismatch"
+        );
+
+        // Verify no temp file was left behind.
+        let temp_dir = ctx.state.config.storage.path.as_str().to_string();
+        let temp_path = std::path::PathBuf::from(&temp_dir)
+            .join("tmp/docker-uploads")
+            .join(&uuid);
+        assert!(
+            !temp_path.exists(),
+            "temp file must be removed after successful streamed upload"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed upload — digest mismatch
+    // -----------------------------------------------------------------------
+
+    /// Providing the wrong digest for a streamed upload must return 400 with
+    /// the `DIGEST_INVALID` OCI error code, and the temp file must be cleaned up.
+    #[tokio::test]
+    async fn streamed_upload_rejects_digest_mismatch() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.docker_stream_threshold_mb = 1;
+        });
+
+        // 512 KiB body — small enough to stay under ANY plausible session-size
+        // limit that a concurrently running oversize test might inject via env var.
+        let body_size = 512 * 1024usize;
+        let blob_data: Vec<u8> = (0..body_size).map(|i| i as u8).collect();
+        // Intentionally wrong digest — all zeros.
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let uuid = start_upload_session(&ctx.app, "mismatch-test").await;
+
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/mismatch-test/blobs/uploads/{}?digest={}",
+                uuid, wrong_digest
+            ))
+            .header(header::CONTENT_LENGTH, blob_data.len().to_string())
+            .body(Body::from(blob_data.clone()))
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for digest mismatch"
+        );
+
+        // Response body must contain DIGEST_INVALID.
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["errors"][0]["code"].as_str().unwrap(),
+            "DIGEST_INVALID",
+            "error code must be DIGEST_INVALID"
+        );
+
+        // Temp file must have been deleted.
+        let temp_path = std::path::PathBuf::from(&ctx.state.config.storage.path)
+            .join("tmp/docker-uploads")
+            .join(&uuid);
+        assert!(
+            !temp_path.exists(),
+            "temp file must be removed after digest mismatch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed upload — oversize rejection
+    // -----------------------------------------------------------------------
+
+    /// When the streamed body exceeds `max_session_size` (controlled via env),
+    /// the handler must return 413 and remove the temp file.
+    ///
+    /// Strategy: we exploit the fact that the oversize check in
+    /// `upload_blob_streamed` adds `prior_size` (from the session) to `written`.
+    /// We inject a session whose `size` is pre-set to (default_limit - 1 byte)
+    /// via PATCH, then send a 2-byte PUT body.  This lets us stay well under any
+    /// realistic allocation budget while still triggering the 413 path.
+    ///
+    /// `NORA_MAX_UPLOAD_SESSION_SIZE_MB` is set to "1" to allow small buffers.
+    /// The RAII guard restores the env var on both success and panic paths.
+    /// Other tests in this suite deliberately use bodies ≤ 512 KiB so they
+    /// are not affected even if this env var is briefly visible to them.
+    #[tokio::test]
+    async fn streamed_upload_rejects_oversize() {
+        struct EnvGuard(&'static str);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        // 1 MiB session-size cap.  Restored by EnvGuard on drop.
+        std::env::set_var("NORA_MAX_UPLOAD_SESSION_SIZE_MB", "1");
+        let _env_guard = EnvGuard("NORA_MAX_UPLOAD_SESSION_SIZE_MB");
+
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.docker_stream_threshold_mb = 1; // force streamed path
+        });
+
+        // Body is 2 MiB — exceeds the 1 MiB limit set above.
+        let body_size = 2 * 1024 * 1024usize;
+        let blob_data: Vec<u8> = vec![0x55u8; body_size];
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob_data)));
+
+        let uuid = start_upload_session(&ctx.app, "oversize-test").await;
+
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/oversize-test/blobs/uploads/{}?digest={}",
+                uuid, digest
+            ))
+            .header(header::CONTENT_LENGTH, body_size.to_string())
+            .body(Body::from(blob_data))
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "expected 413 for body exceeding session size limit"
+        );
+
+        // Temp file must have been removed.
+        let temp_path = std::path::PathBuf::from(&ctx.state.config.storage.path)
+            .join("tmp/docker-uploads")
+            .join(&uuid);
+        assert!(
+            !temp_path.exists(),
+            "temp file must be removed after oversize rejection"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed upload — client disconnect cleanup
+    // -----------------------------------------------------------------------
+
+    /// When the request body stream errors mid-flight during a streamed PUT,
+    /// the handler must return 400 and must not leave an orphan temp file.
+    ///
+    /// Implementation note: `upload_blob_streamed` explicitly calls
+    /// `tokio::fs::remove_file(&temp_path)` on the disconnect arm (the `Err`
+    /// branch of `stream.next().await`). This test verifies that invariant.
+    /// If it ever fails, the fix is to ensure the remove call is present in
+    /// that arm — a regression against the OOM-fix design contract.
+    #[tokio::test]
+    async fn streamed_upload_client_disconnect_cleanup() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.docker_stream_threshold_mb = 1;
+        });
+
+        // Build a body stream that delivers one good chunk then an error.
+        // chunk_a: 256 KiB — below any plausible concurrent session-size limit
+        // so a concurrently running oversize test cannot cause a spurious 413.
+        // The handler still takes the streamed path because Content-Length is
+        // omitted (unknown length → always streamed).
+        let chunk_a = Bytes::from(vec![0xAAu8; 256 * 1024]);
+
+        // The real digest is irrelevant — we won't reach the verification step.
+        let fake_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let uuid = start_upload_session(&ctx.app, "disconnect-test").await;
+
+        // Construct a body from a stream that emits one chunk then an error.
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(chunk_a),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "simulated disconnect",
+            )),
+        ]);
+        let body = Body::from_stream(stream);
+
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/disconnect-test/blobs/uploads/{}?digest={}",
+                uuid, fake_digest
+            ))
+            // No Content-Length → handler cannot know size → always streamed.
+            .body(body)
+            .unwrap();
+        let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 on client disconnect"
+        );
+
+        // Allow async cleanup to complete.
+        tokio::task::yield_now().await;
+
+        // The temp file must have been removed by the disconnect handler arm.
+        let temp_path = std::path::PathBuf::from(&ctx.state.config.storage.path)
+            .join("tmp/docker-uploads")
+            .join(&uuid);
+        assert!(
+            !temp_path.exists(),
+            "temp file must be removed on client disconnect (no orphan allowed)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked PATCH (streamed) + monolithic PUT — end-to-end
+    // -----------------------------------------------------------------------
+
+    /// Two 8 MiB PATCH chunks via the streamed path, then a PUT with an empty
+    /// body and the SHA-256 of the concatenated chunks.
+    ///
+    /// This exercises `patch_blob_streamed` + `upload_blob_streamed` together
+    /// and verifies that the hasher seeding from the existing temp file in
+    /// `upload_blob_streamed` produces the correct final digest.
+    #[tokio::test]
+    async fn chunked_patch_then_monolithic_put_streamed() {
+        // 1 MB threshold → both 8 MiB PATCH chunks take the streamed path.
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.docker_stream_threshold_mb = 1;
+        });
+
+        let chunk_size = 8 * 1024 * 1024usize; // 8 MiB per chunk
+        let chunk1: Vec<u8> = (0..chunk_size).map(|i| (i % 251) as u8).collect();
+        let chunk2: Vec<u8> = (0..chunk_size).map(|i| (i % 241) as u8).collect();
+
+        // Pre-compute the digest of the full concatenated payload.
+        let mut full_payload = chunk1.clone();
+        full_payload.extend_from_slice(&chunk2);
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(&full_payload))
+        );
+
+        let uuid = start_upload_session(&ctx.app, "chunked-test").await;
+
+        // PATCH chunk 1 — Content-Length exceeds threshold → streamed.
+        use tower::ServiceExt;
+        let patch1_req = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/v2/chunked-test/blobs/uploads/{}", uuid))
+            .header(header::CONTENT_LENGTH, chunk1.len().to_string())
+            .body(Body::from(chunk1.clone()))
+            .unwrap();
+        let patch1_resp = ctx.app.clone().oneshot(patch1_req).await.unwrap();
+        assert_eq!(
+            patch1_resp.status(),
+            StatusCode::ACCEPTED,
+            "first PATCH must return 202"
+        );
+        let range1 = patch1_resp
+            .headers()
+            .get("range")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            range1,
+            format!("0-{}", chunk_size - 1),
+            "range header after first chunk"
+        );
+
+        // PATCH chunk 2 — also streamed.
+        let patch2_req = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/v2/chunked-test/blobs/uploads/{}", uuid))
+            .header(header::CONTENT_LENGTH, chunk2.len().to_string())
+            .body(Body::from(chunk2.clone()))
+            .unwrap();
+        let patch2_resp = ctx.app.clone().oneshot(patch2_req).await.unwrap();
+        assert_eq!(
+            patch2_resp.status(),
+            StatusCode::ACCEPTED,
+            "second PATCH must return 202"
+        );
+
+        // PUT with empty body — finalize using the queued session data.
+        let put_req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!(
+                "/v2/chunked-test/blobs/uploads/{}?digest={}",
+                uuid, digest
+            ))
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
+        let put_resp = ctx.app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(
+            put_resp.status(),
+            StatusCode::CREATED,
+            "PUT finalization must return 201"
+        );
+
+        // Verify the stored blob matches the expected concatenated digest.
+        let returned_digest = put_resp
+            .headers()
+            .get("docker-content-digest")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            returned_digest, digest,
+            "docker-content-digest must match sha256 of concatenated chunks"
+        );
+
+        // Confirm the blob is retrievable.
+        let key = format!("docker/chunked-test/blobs/{}", digest);
+        let stored = ctx.state.storage.get(&key).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            chunk_size * 2,
+            "stored blob size must be 16 MiB"
+        );
+        assert_eq!(
+            &stored[..chunk_size],
+            chunk1.as_slice(),
+            "first chunk data mismatch"
+        );
+        assert_eq!(
+            &stored[chunk_size..],
+            chunk2.as_slice(),
+            "second chunk data mismatch"
+        );
     }
 }

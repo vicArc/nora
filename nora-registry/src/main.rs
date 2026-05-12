@@ -27,6 +27,7 @@ mod request_id;
 mod retention;
 mod secrets;
 mod storage;
+mod storage_stats;
 mod tokens;
 mod ui;
 mod validation;
@@ -51,6 +52,7 @@ use dashboard_metrics::DashboardMetrics;
 use registry_type::RegistryType;
 use repo_index::RepoIndex;
 pub use storage::Storage;
+use storage_stats::StorageStatsCache;
 use tokens::TokenStore;
 
 use parking_lot::RwLock;
@@ -161,6 +163,8 @@ pub struct AppState {
     /// Per-IP failed auth attempt tracker for brute-force protection
     pub auth_failures: auth::AuthFailureTracker,
     pub(crate) circuit_breaker: circuit_breaker::CircuitBreakerRegistry,
+    /// Background-cached storage statistics — O(1) reads on the hot path.
+    pub stats: StorageStatsCache,
 }
 
 impl AppState {
@@ -892,6 +896,13 @@ async fn run_server(config: Config, storage: Storage) {
 
     let cb_config = config.circuit_breaker.clone();
 
+    // Build the storage stats cache and perform one eager refresh so the cache
+    // is warm before the HTTP listener binds.  The periodic background task is
+    // spawned after AppState is constructed (needs the storage clone).
+    let stats_interval_secs = config.server.storage_stats_interval_secs;
+    let stats = StorageStatsCache::new();
+    stats.refresh_once(&storage).await;
+
     let state = Arc::new(AppState {
         storage,
         config,
@@ -911,6 +922,7 @@ async fn run_server(config: Config, storage: Storage) {
         curation: curation_engine,
         auth_failures: auth::AuthFailureTracker::new(5, 900),
         circuit_breaker: circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        stats,
     });
 
     // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
@@ -1014,6 +1026,13 @@ async fn run_server(config: Config, storage: Storage) {
         "System endpoints"
     );
 
+    // Spawn background storage stats refresh (O(1) reads on /health hot path).
+    let stats_interval = std::time::Duration::from_secs(stats_interval_secs);
+    state
+        .stats
+        .clone()
+        .spawn_periodic(state.storage.clone(), stats_interval);
+
     // Background task: persist metrics and flush token last_used every 30 seconds
     let metrics_state = state.clone();
     tokio::spawn(async move {
@@ -1028,11 +1047,6 @@ async fn run_server(config: Config, storage: Storage) {
             }
             registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
             metrics_state.auth_failures.cleanup();
-
-            // Every 60s (every other tick): refresh S3 total_size cache
-            if tick_count.is_multiple_of(2) {
-                metrics_state.storage.refresh_total_size_cache().await;
-            }
 
             // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
             if tick_count.is_multiple_of(10) {

@@ -29,8 +29,10 @@ This document describes which parts of each registry protocol are implemented in
 
 ### Known Limitations
 - Max 2-level image path: `org/image:tag` works, `org/sub/path/image:tag` returns 404
-- Large monolithic blob PUT (>~500MB) may fail even with high body limit
 - No cross-repository blob mounting
+
+### Streaming Upload
+Blob uploads at or above `NORA_DOCKER_STREAM_THRESHOLD_MB` (default 1024 MiB) stream body chunks directly to disk, keeping memory usage bounded regardless of layer size. Uploads below the threshold remain in-memory for lower latency.
 
 ## npm
 
